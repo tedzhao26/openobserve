@@ -11,12 +11,13 @@ This audit examines the trace ingestion pipeline in OpenObserve, identifying arc
 1. [Trace Ingestion Architecture](#trace-ingestion-architecture)
 2. [Physical Data Swap Architecture](#physical-data-swap-architecture)
 3. [S3 Capacity Scaling Architecture](#s3-capacity-scaling-architecture)
-4. [Data Flow Analysis](#data-flow-analysis)
-5. [Bottleneck Analysis](#bottleneck-analysis)
-6. [Caveats and Limitations](#caveats-and-limitations)
-7. [Comparison with Elasticsearch](#comparison-with-elasticsearch)
-8. [Configuration Tuning Guide](#configuration-tuning-guide)
-9. [Recommendations](#recommendations)
+4. [Deep Dive: File Index & Hot/Cold Data Management](#deep-dive-file-index--hotcold-data-management)
+5. [Data Flow Analysis](#data-flow-analysis)
+6. [Bottleneck Analysis](#bottleneck-analysis)
+7. [Caveats and Limitations](#caveats-and-limitations)
+8. [Comparison with Elasticsearch](#comparison-with-elasticsearch)
+9. [Configuration Tuning Guide](#configuration-tuning-guide)
+10. [Recommendations](#recommendations)
 
 ---
 
@@ -421,6 +422,285 @@ flowchart TB
     style Query fill:#fff3e0
     style CacheCheck fill:#e3f2fd
     style Populate fill:#e8f5e9
+```
+
+---
+
+## Deep Dive: File Index & Hot/Cold Data Management
+
+### How S3 File Index Works (file_list Database)
+
+The key to understanding OpenObserve is: **S3 has no index**. OpenObserve maintains its own metadata database (`file_list` table) that acts as the "index" for all S3 files.
+
+```mermaid
+erDiagram
+    FILE_LIST {
+        bigint id PK "Auto-increment ID"
+        varchar account "S3 account name"
+        varchar org "Organization ID"
+        varchar stream "org/stream_type/stream_name"
+        varchar date "YYYY/MM/DD/HH"
+        varchar file "unique_id.parquet"
+        boolean deleted "Soft delete flag"
+        boolean flattened "Is data flattened"
+        bigint min_ts "Minimum timestamp in file"
+        bigint max_ts "Maximum timestamp in file"
+        bigint records "Number of records"
+        bigint original_size "Uncompressed size"
+        bigint compressed_size "Compressed size"
+        bigint index_size "Bloom filter size"
+        bigint created_at "Created timestamp"
+        bigint updated_at "Updated timestamp"
+    }
+    
+    STREAM_STATS {
+        bigint id PK
+        varchar org
+        varchar stream
+        bigint file_num "Total files"
+        bigint min_ts "Earliest data"
+        bigint max_ts "Latest data"
+        bigint records "Total records"
+        bigint original_size
+        bigint compressed_size
+        bigint index_size
+    }
+    
+    FILE_LIST_DELETED {
+        bigint id PK
+        varchar file
+        bigint created_at "When marked for deletion"
+    }
+    
+    FILE_LIST_JOBS {
+        bigint id PK
+        varchar stream
+        bigint offsets "Time offset for compaction"
+        int status "pending/running/done"
+        varchar node "Compactor node"
+    }
+```
+
+### Query Flow: How Files Are Located
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Querier
+    participant FileListDB as File List DB<br/>(PostgreSQL)
+    participant LocalCache as Local Cache<br/>(Disk/Memory)
+    participant S3 as Object Storage<br/>(S3)
+    
+    Client->>Querier: Query: traces WHERE time > T1 AND time < T2
+    
+    Note over Querier: Step 1: Find relevant files
+    Querier->>FileListDB: SELECT * FROM file_list<br/>WHERE stream='default/traces/default'<br/>AND min_ts <= T2 AND max_ts >= T1
+    FileListDB-->>Querier: List of FileKey objects<br/>[{file: "2024/12/12/14/abc.parquet", min_ts, max_ts, ...}]
+    
+    Note over Querier: Step 2: Prune by time range
+    Querier->>Querier: Filter files by time overlap
+    
+    loop For each file needed
+        Note over Querier: Step 3: Check caches
+        Querier->>LocalCache: Check memory cache
+        alt Cache Hit
+            LocalCache-->>Querier: Return cached parquet bytes
+        else Cache Miss
+            Querier->>LocalCache: Check disk cache
+            alt Disk Cache Hit
+                LocalCache-->>Querier: Return from disk
+            else Disk Cache Miss
+                Note over Querier: Step 4: Download from S3
+                Querier->>S3: GET files/default/traces/default/2024/12/12/14/abc.parquet
+                S3-->>Querier: Parquet file bytes
+                Querier->>LocalCache: Store in cache (async)
+            end
+        end
+    end
+    
+    Note over Querier: Step 5: Execute query with DataFusion
+    Querier->>Querier: Read parquet, apply filters, aggregate
+    Querier-->>Client: Query results
+```
+
+### Local Buffering + S3 Persistence: Complete Flow
+
+```mermaid
+flowchart TB
+    subgraph Ingestion["📥 Ingestion (Synchronous)"]
+        direction TB
+        
+        subgraph Step1["Step 1: Dual Write"]
+            REQ["Incoming Data"]
+            WAL_W["Write to WAL\n(append-only file)"]
+            MEM_W["Write to Memtable\n(Arrow RecordBatch)"]
+            
+            REQ --> WAL_W
+            REQ --> MEM_W
+        end
+        
+        ACK["Return Success\n(data is durable)"]
+        Step1 --> ACK
+    end
+    
+    subgraph Background["⚙️ Background Processing"]
+        direction TB
+        
+        subgraph Step2["Step 2: Freeze Memtable"]
+            CHECK["Check triggers:\n• Size > ZO_MAX_FILE_SIZE_IN_MEMORY\n• Time > ZO_MAX_FILE_RETENTION_TIME"]
+            FREEZE["Freeze memtable\n→ Immutable"]
+            NEW_MEM["Create new\nempty memtable"]
+            
+            CHECK --> FREEZE
+            FREEZE --> NEW_MEM
+        end
+        
+        subgraph Step3["Step 3: Convert to Parquet"]
+            CONVERT["Arrow → Parquet\nwith compression (ZSTD)"]
+            LOCAL["Write to local disk\n/data/wal/files/{stream}/"]
+        end
+        
+        subgraph Step4["Step 4: Batch & Merge"]
+            BATCH["Collect files\nfrom same partition"]
+            MERGE["Merge small files\ninto larger files\n(target: 256MB)"]
+        end
+        
+        subgraph Step5["Step 5: Upload to S3"]
+            UPLOAD["PUT to S3\nfiles/{org}/{type}/{stream}/{date}/{id}.parquet"]
+            META["INSERT INTO file_list\n(org, stream, date, file, min_ts, max_ts, ...)"]
+        end
+        
+        subgraph Step6["Step 6: Cleanup"]
+            DEL_WAL["Delete WAL entries"]
+            DEL_LOCAL["Delete local parquet"]
+        end
+        
+        Step2 --> Step3 --> Step4 --> Step5 --> Step6
+    end
+    
+    style Ingestion fill:#e8f5e9
+    style Background fill:#fff3e0
+```
+
+### Hot/Cold Data Swapping Strategy
+
+```mermaid
+flowchart TB
+    subgraph DataTemperature["📊 Data Temperature Classification"]
+        direction LR
+        HOT["🔥 HOT\n< 1 hour old\nIn Memtable"]
+        WARM["🌡️ WARM\n1-24 hours old\nLocal disk cache"]
+        COLD["❄️ COLD\n> 24 hours old\nS3 only"]
+        
+        HOT -->|"Freeze & persist"| WARM
+        WARM -->|"Cache eviction"| COLD
+    end
+    
+    subgraph CacheEviction["🗑️ Cache Eviction Strategies"]
+        direction TB
+        
+        LRU["LRU (Least Recently Used)\n• Default strategy\n• Evicts least accessed files\n• Good for random access"]
+        
+        FIFO["FIFO (First In First Out)\n• Simple, predictable\n• Evicts oldest cached files\n• Good for streaming"]
+        
+        TIMELRU["TimeLRU (Time-partitioned LRU)\n• Groups files by hour\n• Evicts oldest hour first\n• Then LRU within hour\n• Best for time-series"]
+    end
+    
+    subgraph CacheConfig["⚙️ Cache Configuration"]
+        direction TB
+        
+        MEM_CACHE["Memory Cache\nZO_MEMORY_CACHE_ENABLED=true\nZO_MEMORY_CACHE_SIZE=1024 (MB)\nZO_MEMORY_CACHE_STRATEGY=lru"]
+        
+        DISK_CACHE["Disk Cache\nZO_DISK_CACHE_ENABLED=true\nZO_DISK_CACHE_SIZE=10240 (MB)\nZO_DISK_CACHE_STRATEGY=time_lru\nZO_DISK_CACHE_BUCKET_NUM=16"]
+    end
+    
+    style DataTemperature fill:#e3f2fd
+    style CacheEviction fill:#fff3e0
+    style CacheConfig fill:#e8f5e9
+```
+
+### TimeLRU Eviction (Recommended for Observability)
+
+```mermaid
+flowchart TB
+    subgraph TimeLRU["TimeLRU Strategy - How It Works"]
+        direction TB
+        
+        subgraph Buckets["Time-Partitioned Buckets"]
+            B1["Hour 14:00\nLRU Cache\n[file_a, file_b, file_c]"]
+            B2["Hour 15:00\nLRU Cache\n[file_d, file_e]"]
+            B3["Hour 16:00\nLRU Cache\n[file_f, file_g, file_h]"]
+        end
+        
+        subgraph Eviction["Eviction Order"]
+            E1["1. Find oldest hour\nwith cached files"]
+            E2["2. Within that hour,\nevict LRU file"]
+            E3["3. If hour empty,\nmove to next hour"]
+        end
+        
+        subgraph Example["Example: Cache Full, Need Space"]
+            EX1["Cache: 10GB / 10GB"]
+            EX2["Evict file_a from Hour 14:00\n(oldest hour, least recently used)"]
+            EX3["Cache: 9.8GB / 10GB\nReady for new file"]
+        end
+        
+        Buckets --> Eviction --> Example
+    end
+    
+    style TimeLRU fill:#e8f5e9
+```
+
+### Why This Architecture is Efficient
+
+```mermaid
+flowchart LR
+    subgraph Traditional["❌ Traditional Index on S3"]
+        T1["Every query must\nLIST all S3 objects"]
+        T2["Filter by prefix\n(slow, costly)"]
+        T3["No time-range\noptimization"]
+        T4["$0.005 per 1000\nLIST requests"]
+    end
+    
+    subgraph OpenObserve["✅ OpenObserve Approach"]
+        O1["Query file_list DB\n(indexed, fast)"]
+        O2["Get exact file paths\nwith time ranges"]
+        O3["Prune by min_ts/max_ts\nbefore download"]
+        O4["Only GET needed files\n$0.0004 per 1000 GETs"]
+    end
+    
+    style Traditional fill:#ffebee
+    style OpenObserve fill:#e8f5e9
+```
+
+### Key Insight: Separation of Metadata and Data
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         OpenObserve Architecture                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌──────────────────────┐          ┌──────────────────────────────────┐   │
+│   │   Metadata Layer     │          │        Data Layer                │   │
+│   │   (PostgreSQL/MySQL) │          │        (S3/GCS/Azure)            │   │
+│   ├──────────────────────┤          ├──────────────────────────────────┤   │
+│   │ • file_list table    │          │ • Parquet files                  │   │
+│   │ • stream_stats       │  ──────► │ • Organized by time partitions   │   │
+│   │ • Indexed by:        │          │ • No listing needed              │   │
+│   │   - org              │          │ • Direct path access             │   │
+│   │   - stream           │          │                                  │   │
+│   │   - min_ts/max_ts    │          │ files/{org}/{type}/{stream}/     │   │
+│   │   - date             │          │       {year}/{month}/{day}/{hour}/│   │
+│   │                      │          │       {unique_id}.parquet        │   │
+│   │ Query: O(log n)      │          │ Access: O(1) per file            │   │
+│   └──────────────────────┘          └──────────────────────────────────┘   │
+│                                                                              │
+│   Benefits:                                                                  │
+│   • Query planning: Know exactly which files to read BEFORE touching S3    │
+│   • Time pruning: Skip files outside query time range                      │
+│   • Stats: Know record counts, sizes without scanning                      │
+│   • Soft delete: Mark deleted, cleanup later (no S3 LIST needed)          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Storage Cost Comparison
