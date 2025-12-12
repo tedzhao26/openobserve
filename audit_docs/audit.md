@@ -9,12 +9,14 @@ This audit examines the trace ingestion pipeline in OpenObserve, identifying arc
 ## Table of Contents
 
 1. [Trace Ingestion Architecture](#trace-ingestion-architecture)
-2. [Data Flow Analysis](#data-flow-analysis)
-3. [Bottleneck Analysis](#bottleneck-analysis)
-4. [Caveats and Limitations](#caveats-and-limitations)
-5. [Comparison with Elasticsearch](#comparison-with-elasticsearch)
-6. [Configuration Tuning Guide](#configuration-tuning-guide)
-7. [Recommendations](#recommendations)
+2. [Physical Data Swap Architecture](#physical-data-swap-architecture)
+3. [S3 Capacity Scaling Architecture](#s3-capacity-scaling-architecture)
+4. [Data Flow Analysis](#data-flow-analysis)
+5. [Bottleneck Analysis](#bottleneck-analysis)
+6. [Caveats and Limitations](#caveats-and-limitations)
+7. [Comparison with Elasticsearch](#comparison-with-elasticsearch)
+8. [Configuration Tuning Guide](#configuration-tuning-guide)
+9. [Recommendations](#recommendations)
 
 ---
 
@@ -129,6 +131,314 @@ flowchart TB
 - **Parquet format**: Columnar storage with high compression
 - **Multi-backend**: Local disk, S3, MinIO, GCS, Azure Blob
 - **Caching**: Disk and memory caches for query acceleration
+
+---
+
+## Physical Data Swap Architecture
+
+### Memory → Disk → Object Storage Data Flow
+
+```mermaid
+flowchart TB
+    subgraph Ingestion["📥 Hot Path (Synchronous)"]
+        direction LR
+        REQ["Incoming\nRequest"]
+        WAL_BUF["WAL Buffer\n(8KB-64KB)"]
+        WAL_FILE["WAL File\n(Local Disk)"]
+        MEM["Memtable\n(Arrow RecordBatch)"]
+        
+        REQ -->|"1. Append"| WAL_BUF
+        WAL_BUF -->|"2. Flush/fsync"| WAL_FILE
+        REQ -->|"3. Write"| MEM
+    end
+    
+    subgraph Background["⚙️ Background Path (Async)"]
+        direction TB
+        IMM["Immutable\nMemtable"]
+        PARQ_LOCAL["Local Parquet\n(/data/wal/files/)"]
+        MERGE["File Merger\n(Multiple threads)"]
+        
+        MEM -->|"4. Freeze\n(size/time)"| IMM
+        IMM -->|"5. Convert\nto Parquet"| PARQ_LOCAL
+        PARQ_LOCAL -->|"6. Batch &\nMerge"| MERGE
+    end
+    
+    subgraph Remote["☁️ Object Storage (S3/GCS/Azure)"]
+        direction TB
+        S3_PUT["PUT Object\n(multipart if >5MB)"]
+        S3_BUCKET["Object Storage\nBucket"]
+        META_DB["File List DB\n(PostgreSQL/MySQL)"]
+        
+        MERGE -->|"7. Upload"| S3_PUT
+        S3_PUT -->|"8. Store"| S3_BUCKET
+        S3_PUT -->|"9. Record\nmetadata"| META_DB
+    end
+    
+    subgraph Cleanup["🧹 Cleanup"]
+        WAL_DEL["Delete WAL"]
+        LOCAL_DEL["Delete Local\nParquet"]
+        
+        META_DB -->|"10. On success"| WAL_DEL
+        META_DB -->|"10. On success"| LOCAL_DEL
+    end
+    
+    style Ingestion fill:#e8f5e9
+    style Background fill:#fff3e0
+    style Remote fill:#e3f2fd
+    style Cleanup fill:#ffebee
+```
+
+### Physical Storage Tiers
+
+```mermaid
+flowchart LR
+    subgraph Tier1["🔥 Tier 1: Memory (Fastest)"]
+        direction TB
+        T1_WAL["WAL Buffer\n~64KB per bucket"]
+        T1_MEM["Memtable\nArrow RecordBatch\n(configurable max)"]
+        T1_CACHE["Memory Cache\n(LRU eviction)"]
+    end
+    
+    subgraph Tier2["💾 Tier 2: Local Disk (Fast)"]
+        direction TB
+        T2_WAL["WAL Files\n/data/wal/logs/"]
+        T2_PARQ["Local Parquet\n/data/wal/files/"]
+        T2_CACHE["Disk Cache\n(FIFO/LRU/TimeLRU)"]
+    end
+    
+    subgraph Tier3["☁️ Tier 3: Object Storage (Infinite)"]
+        direction TB
+        T3_S3["S3/GCS/Azure\nfiles/{org}/{type}/{stream}/"]
+        T3_META["Metadata DB\n(file_list table)"]
+    end
+    
+    T1_WAL -->|"fsync"| T2_WAL
+    T1_MEM -->|"freeze & convert"| T2_PARQ
+    T2_PARQ -->|"upload & delete local"| T3_S3
+    T2_WAL -->|"cleanup after upload"| T2_WAL
+    
+    T3_S3 -.->|"cache on read"| T2_CACHE
+    T2_CACHE -.->|"promote hot data"| T1_CACHE
+    
+    style Tier1 fill:#ffebee
+    style Tier2 fill:#fff3e0
+    style Tier3 fill:#e3f2fd
+```
+
+### File Path Convention
+
+```
+Object Storage Layout:
+files/{org_id}/{stream_type}/{stream_name}/{year}/{month}/{day}/{hour}/{unique_id}.parquet
+
+Example:
+files/default/traces/default/2024/12/12/14/7f3a2b1c9d8e4f5a.parquet
+     │         │       │       │    │   │   │   └── Unique file ID
+     │         │       │       │    │   │   └── Hour partition (00-23)
+     │         │       │       │    │   └── Day partition
+     │         │       │       │    └── Month partition
+     │         │       │       └── Year partition
+     │         │       └── Stream name
+     │         └── Stream type (logs/traces/metrics)
+     └── Organization ID
+```
+
+---
+
+## S3 Capacity Scaling Architecture
+
+### Horizontal Scaling Model
+
+```mermaid
+flowchart TB
+    subgraph Ingesters["📥 Ingester Nodes (Stateless)"]
+        I1["Ingester 1\n(WAL + Memtable)"]
+        I2["Ingester 2\n(WAL + Memtable)"]
+        I3["Ingester N\n(WAL + Memtable)"]
+    end
+    
+    subgraph Queriers["🔍 Querier Nodes (Stateless)"]
+        Q1["Querier 1\n(Disk Cache)"]
+        Q2["Querier 2\n(Disk Cache)"]
+        Q3["Querier N\n(Disk Cache)"]
+    end
+    
+    subgraph Compactors["🔧 Compactor Nodes"]
+        C1["Compactor 1"]
+        C2["Compactor N"]
+    end
+    
+    subgraph SharedStorage["☁️ Shared Object Storage (Infinite Scale)"]
+        S3["S3 / GCS / Azure Blob\n• No capacity limits\n• Pay per GB stored\n• 11 nines durability"]
+    end
+    
+    subgraph MetaDB["📊 Metadata Store"]
+        DB["PostgreSQL / MySQL\n(file_list table)"]
+    end
+    
+    I1 & I2 & I3 -->|"Upload Parquet"| S3
+    I1 & I2 & I3 -->|"Register files"| DB
+    
+    Q1 & Q2 & Q3 <-->|"Read Parquet"| S3
+    Q1 & Q2 & Q3 <-->|"Query file list"| DB
+    
+    C1 & C2 -->|"Read small files"| S3
+    C1 & C2 -->|"Write merged files"| S3
+    C1 & C2 <-->|"Update file list"| DB
+    
+    style Ingesters fill:#e8f5e9
+    style Queriers fill:#e3f2fd
+    style Compactors fill:#fff3e0
+    style SharedStorage fill:#f3e5f5
+    style MetaDB fill:#fce4ec
+```
+
+### Why S3 Enables Infinite Scaling
+
+```mermaid
+flowchart LR
+    subgraph Traditional["❌ Traditional (Elasticsearch)"]
+        direction TB
+        ES_N1["Node 1\n💾 Local Storage\n1TB limit"]
+        ES_N2["Node 2\n💾 Local Storage\n1TB limit"]
+        ES_N3["Node 3\n💾 Local Storage\n1TB limit"]
+        ES_REP["Replicas needed\nfor durability"]
+        
+        ES_N1 <--> ES_N2 <--> ES_N3
+        ES_N1 & ES_N2 & ES_N3 --> ES_REP
+    end
+    
+    subgraph Modern["✅ OpenObserve (S3-Native)"]
+        direction TB
+        OO_N1["Ingester 1\n🔥 Hot data only\n~10GB local"]
+        OO_N2["Ingester 2\n🔥 Hot data only\n~10GB local"]
+        OO_S3["S3 Bucket\n☁️ Unlimited\n• Auto scales\n• Built-in redundancy\n• ~$0.023/GB/month"]
+        
+        OO_N1 --> OO_S3
+        OO_N2 --> OO_S3
+    end
+    
+    style Traditional fill:#ffebee
+    style Modern fill:#e8f5e9
+```
+
+### Data Compaction Flow
+
+```mermaid
+sequenceDiagram
+    participant Scheduler as Compaction Scheduler
+    participant Worker as Compactor Worker
+    participant DB as File List DB
+    participant S3 as Object Storage
+    participant Cache as Local Cache
+
+    Note over Scheduler: Runs every 10 seconds
+    
+    Scheduler->>DB: Query files older than 1 hour
+    DB-->>Scheduler: List of small files per partition
+    
+    loop For each partition with multiple small files
+        Scheduler->>Worker: Submit merge job
+        
+        Worker->>S3: Download small parquet files
+        S3-->>Worker: File contents
+        
+        Worker->>Worker: Read with DataFusion
+        Worker->>Worker: Sort by _timestamp
+        Worker->>Worker: Apply bloom filters
+        Worker->>Worker: Write merged parquet
+        
+        Note over Worker: Target size: 256MB (configurable)
+        
+        Worker->>S3: Upload merged file
+        S3-->>Worker: Success
+        
+        Worker->>DB: Transaction: Add new file, mark old as deleted
+        DB-->>Worker: Committed
+        
+        Worker->>S3: Delete old small files
+        Worker->>Cache: Invalidate cached files
+    end
+```
+
+### Multi-Account S3 Support
+
+```mermaid
+flowchart TB
+    subgraph Accounts["🗂️ Multiple S3 Accounts"]
+        A1["Account: default\nBucket: prod-data\nRegion: us-east-1"]
+        A2["Account: archive\nBucket: archive-data\nRegion: us-west-2"]
+        A3["Account: hot\nBucket: hot-data\nRegion: eu-west-1"]
+    end
+    
+    subgraph Router["🔀 Storage Router"]
+        R["Account Selection\nbased on file path"]
+    end
+    
+    subgraph FileTypes["📁 File Routing"]
+        F1["Recent data\n(< 7 days)"] -->|"hot account"| A3
+        F2["Standard data\n(7-90 days)"] -->|"default account"| A1
+        F3["Archive data\n(> 90 days)"] -->|"archive account"| A2
+    end
+    
+    Router --> Accounts
+    
+    style Accounts fill:#e3f2fd
+    style Router fill:#fff3e0
+    style FileTypes fill:#e8f5e9
+```
+
+### Cache Hierarchy for Query Performance
+
+```mermaid
+flowchart TB
+    subgraph Query["🔍 Query Request"]
+        REQ["SELECT * FROM traces\nWHERE service='api'"]
+    end
+    
+    subgraph CacheCheck["Cache Lookup (Fast → Slow)"]
+        direction TB
+        
+        MC["1️⃣ Memory Cache\n• LRU eviction\n• ~μs latency\n• Size: ZO_MEMORY_CACHE_SIZE"]
+        
+        DC["2️⃣ Disk Cache\n• FIFO/LRU/TimeLRU\n• ~ms latency\n• Size: ZO_DISK_CACHE_SIZE"]
+        
+        S3["3️⃣ Object Storage\n• ~100ms latency\n• Unlimited"]
+        
+        MC -->|"Miss"| DC
+        DC -->|"Miss"| S3
+    end
+    
+    subgraph Populate["Cache Population"]
+        POP["Download & Cache\n(async background)"]
+    end
+    
+    Query --> MC
+    S3 -->|"On read"| POP
+    POP -->|"Store for future"| DC
+    POP -.->|"Hot data"| MC
+    
+    style Query fill:#fff3e0
+    style CacheCheck fill:#e3f2fd
+    style Populate fill:#e8f5e9
+```
+
+### Storage Cost Comparison
+
+```mermaid
+pie title Storage Cost Distribution (100TB data, 30 days)
+    "Elasticsearch (3x replication, SSD)" : 45000
+    "OpenObserve (S3 Standard)" : 2300
+    "OpenObserve (S3 IA)" : 1250
+    "OpenObserve (S3 Glacier)" : 400
+```
+
+| Storage Option | Cost/TB/Month | 100TB/30 days | Notes |
+|----------------|---------------|---------------|-------|
+| Elasticsearch (SSD, 3x) | ~$150 | ~$45,000 | Requires 3x for durability |
+| OpenObserve + S3 Standard | ~$23 | ~$2,300 | Built-in 11-nines durability |
+| OpenObserve + S3 IA | ~$12.50 | ~$1,250 | Infrequent access tier |
+| OpenObserve + S3 Glacier | ~$4 | ~$400 | Archive tier |
 
 ---
 
