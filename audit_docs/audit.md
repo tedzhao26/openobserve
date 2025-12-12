@@ -428,6 +428,195 @@ flowchart TB
 
 ## Deep Dive: File Index & Hot/Cold Data Management
 
+### The Core Problem: S3 Has No Index
+
+**S3 (and all object storage) has no built-in index**. You cannot efficiently query "give me all files where timestamp > X". S3 only supports:
+
+| Operation | Cost | Use Case |
+|-----------|------|----------|
+| `LIST` | **Expensive** ($0.005/1000 requests) | Returns ALL objects, no filtering |
+| `GET` | **Cheap** ($0.0004/1000 requests) | Needs exact path, returns single file |
+
+This is why traditional approaches (like some Elasticsearch alternatives) are slow and expensive on S3 - they must LIST thousands of objects to find relevant files.
+
+### OpenObserve's Solution: Separate Metadata from Data
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    The Two-Layer Architecture                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌─────────────────────────┐         ┌─────────────────────────────────┐  │
+│   │   METADATA LAYER        │         │   DATA LAYER                    │  │
+│   │   (PostgreSQL/MySQL)    │         │   (S3/GCS/Azure)                │  │
+│   ├─────────────────────────┤         ├─────────────────────────────────┤  │
+│   │                         │         │                                 │  │
+│   │  file_list table:       │  ────►  │  Parquet files stored at        │  │
+│   │  • org, stream          │         │  predictable paths:             │  │
+│   │  • min_ts, max_ts       │         │                                 │  │
+│   │  • file path            │         │  files/{org}/{type}/{stream}/   │  │
+│   │  • size, records        │         │        {year}/{month}/{day}/    │  │
+│   │                         │         │        {hour}/{id}.parquet      │  │
+│   │  Indexed columns:       │         │                                 │  │
+│   │  • stream + date        │         │  No listing required!           │  │
+│   │  • min_ts, max_ts       │         │  Direct GET by path             │  │
+│   │                         │         │                                 │  │
+│   │  Query: O(log n)        │         │  Access: O(1) per file          │  │
+│   └─────────────────────────┘         └─────────────────────────────────┘  │
+│                                                                             │
+│   Benefits:                                                                 │
+│   ✅ Query planning: Know exactly which files BEFORE touching S3           │
+│   ✅ Time pruning: Skip files outside query time range                     │
+│   ✅ Statistics: Know record counts, sizes without scanning                │
+│   ✅ Soft delete: Mark deleted, cleanup later (no S3 LIST needed)          │
+│   ✅ Cost efficient: Only cheap GET requests, no expensive LIST            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Hot/Cold Data Model Explained
+
+OpenObserve uses a **temperature-based data model** where data moves from hot (fast, expensive) to cold (slow, cheap) storage automatically:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Data Temperature Lifecycle                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   🔥 HOT DATA (< 1 hour old)                                               │
+│   ├── Location: RAM (Memtable)                                              │
+│   ├── Access time: microseconds (μs)                                        │
+│   ├── Cost: Highest (RAM is expensive)                                      │
+│   └── Purpose: Fast ingestion acknowledgment                                │
+│       │                                                                     │
+│       │  Trigger: Size > ZO_MAX_FILE_SIZE_IN_MEMORY                        │
+│       │           OR Time > ZO_MAX_FILE_RETENTION_TIME                      │
+│       ▼                                                                     │
+│   🌡️ WARM DATA (1-24 hours old)                                            │
+│   ├── Location: Local SSD (Disk Cache)                                      │
+│   ├── Access time: milliseconds (ms)                                        │
+│   ├── Cost: Medium (local disk)                                             │
+│   └── Purpose: Fast queries on recent data                                  │
+│       │                                                                     │
+│       │  Trigger: Cache full (eviction by LRU/FIFO/TimeLRU)                │
+│       ▼                                                                     │
+│   ❄️ COLD DATA (> 24 hours old)                                             │
+│   ├── Location: S3 only                                                     │
+│   ├── Access time: ~100ms (network)                                         │
+│   ├── Cost: Lowest (~$0.023/GB/month)                                       │
+│   └── Purpose: Long-term retention, compliance                              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### How Queries Work Across Hot/Cold Data
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   Query: "Show me traces from the last 2 hours where service='payment'"     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Step 1: PLAN (Query file_list database)                                   │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │ SELECT file, min_ts, max_ts FROM file_list                          │  │
+│   │ WHERE stream = 'default/traces/default'                              │  │
+│   │   AND max_ts >= (now - 2 hours)                                      │  │
+│   │   AND min_ts <= now                                                  │  │
+│   │                                                                      │  │
+│   │ Result: 5 files match time range                                     │  │
+│   │   • 2024/12/12/14/abc.parquet (min_ts=14:00, max_ts=14:30)          │  │
+│   │   • 2024/12/12/14/def.parquet (min_ts=14:30, max_ts=15:00)          │  │
+│   │   • 2024/12/12/15/ghi.parquet (min_ts=15:00, max_ts=15:30)          │  │
+│   │   • 2024/12/12/15/jkl.parquet (min_ts=15:30, max_ts=16:00)          │  │
+│   │   • Current memtable (min_ts=16:00, max_ts=now)                      │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│   Step 2: FETCH (Check cache hierarchy for each file)                       │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │   File abc.parquet:                                                  │  │
+│   │     [Memory Cache] ✗ Miss                                            │  │
+│   │     [Disk Cache]   ✗ Miss                                            │  │
+│   │     [S3]           ✓ Download → Cache for future                     │  │
+│   │                                                                      │  │
+│   │   File def.parquet:                                                  │  │
+│   │     [Memory Cache] ✗ Miss                                            │  │
+│   │     [Disk Cache]   ✓ Hit! (still warm)                               │  │
+│   │                                                                      │  │
+│   │   File ghi.parquet:                                                  │  │
+│   │     [Memory Cache] ✓ Hit! (recently queried)                         │  │
+│   │                                                                      │  │
+│   │   File jkl.parquet:                                                  │  │
+│   │     [Disk Cache]   ✓ Hit! (still warm)                               │  │
+│   │                                                                      │  │
+│   │   Current memtable:                                                  │  │
+│   │     [Memory]       ✓ Direct read from RAM                            │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│   Step 3: EXECUTE (DataFusion query engine)                                 │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │   • Read parquet files with columnar projection                      │  │
+│   │   • Apply predicate pushdown (service='payment')                     │  │
+│   │   • Aggregate results from all files                                 │  │
+│   │   • Return to client                                                 │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cache Eviction Strategies in Detail
+
+| Strategy | How It Works | Best For |
+|----------|--------------|----------|
+| **LRU** | Evicts least recently accessed file | Random access patterns |
+| **FIFO** | Evicts oldest cached file (first in, first out) | Streaming, predictable access |
+| **TimeLRU** | Groups files by hour; evicts oldest hour first, then LRU within hour | **Observability workloads** (recommended) |
+
+**Why TimeLRU is best for traces/logs:**
+- Observability queries are typically time-bounded ("last 1 hour", "last 24 hours")
+- Recent data is queried more frequently
+- Old data can be evicted as a group (by hour)
+- Prevents "thrashing" where one old file keeps evicting recent files
+
+### Summary: The Complete Data Journey
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Complete Data Lifecycle                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  WRITE PATH (Ingestion)                 READ PATH (Query)                   │
+│  ─────────────────────                  ────────────────                    │
+│                                                                             │
+│  1. Data arrives via HTTP/gRPC          1. Parse query, extract time range  │
+│           │                                      │                          │
+│           ▼                                      ▼                          │
+│  2. Write to WAL (durability)           2. Query file_list DB for files    │
+│           │                                      │                          │
+│           ▼                                      ▼                          │
+│  3. Write to Memtable (fast ack)        3. For each file:                  │
+│           │                                 • Check memory cache            │
+│           │                                 • Check disk cache              │
+│           │                                 • Fallback to S3                │
+│           ▼                                      │                          │
+│  4. [Background] Freeze memtable               ▼                          │
+│           │                             4. Execute query with DataFusion    │
+│           ▼                                      │                          │
+│  5. Convert to Parquet                          ▼                          │
+│           │                             5. Return results                   │
+│           ▼                                                                 │
+│  6. Upload to S3                                                            │
+│           │                                                                 │
+│           ▼                                                                 │
+│  7. Register in file_list DB                                                │
+│           │                                                                 │
+│           ▼                                                                 │
+│  8. Delete local WAL & temp files                                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ### How S3 File Index Works (file_list Database)
 
 The key to understanding OpenObserve is: **S3 has no index**. OpenObserve maintains its own metadata database (`file_list` table) that acts as the "index" for all S3 files.
